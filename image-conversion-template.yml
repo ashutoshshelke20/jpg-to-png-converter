@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for deploying an image conversion web application using S3, Lambda, and API Gateway.
+
+Resources:
+  ImageS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub "${AWS::StackName}-image-bucket"
+      VersioningConfiguration: 
+        Status: Enabled
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub arn:aws:s3:::${ImageS3Bucket}
+                  - !Sub arn:aws:s3:::${ImageS3Bucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - "arn:aws:logs:*:*:*"
+
+  ImageConversionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-image-conversion-function"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          from PIL import Image
+          import io
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              bucket_name = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              s3_object = s3.get_object(Bucket=bucket_name, Key=key)
+              
+              if s3_object['ContentLength'] > 10 * 1024 * 1024:
+                  return {"statusCode": 400, "body": "Image size exceeds 10MB limit."}
+              
+              image = Image.open(io.BytesIO(s3_object['Body'].read()))
+              output_buffer = io.BytesIO()
+              image.save(output_buffer, format='PNG')
+              output_buffer.seek(0)
+              
+              output_key = key.split('.')[0] + ".png"
+              s3.put_object(Bucket=bucket_name, Key=output_key, Body=output_buffer)
+              
+              return {"statusCode": 200, "body": f"Image converted and stored at {output_key}"}
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+
+  ImageUploadApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-image-upload-api"
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt 
+        - ImageUploadApi
+        - RootResourceId
+      PathPart: "upload"
+      RestApiId: !Ref ImageUploadApi
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ImageUploadApi
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionArn}/invocations
+          - LambdaFunctionArn: !GetAtt ImageConversionFunction.Arn
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      StageName: prod
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ImageConversionFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageUploadApi}/*/POST/upload"
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint for image upload"
+    Value: !Sub "https://${ImageUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
